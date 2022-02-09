@@ -1379,6 +1379,133 @@ writeNodeValueAttribute(UA_Server *server, UA_Session *session,
 }
 
 static UA_StatusCode
+writeNodeValueAttributeWithoutCallback(UA_Server *server, UA_Session *session,
+                                       UA_VariableNode *node, const UA_DataValue *value,
+                                       const UA_String *indexRange) {
+    UA_assert(node != NULL);
+    UA_assert(session != NULL);
+
+    /* Parse the range */
+    UA_NumericRange range;
+    UA_NumericRange *rangeptr = NULL;
+    UA_StatusCode retval = UA_STATUSCODE_GOOD;
+    if(indexRange && indexRange->length > 0) {
+        retval = UA_NumericRange_parse(&range, *indexRange);
+        if(retval != UA_STATUSCODE_GOOD)
+            return retval;
+        rangeptr = &range;
+    }
+
+    /* Created an editable version. The data is not touched. Only the variant
+     * "container". */
+    UA_DataValue adjustedValue = *value;
+
+    /* Type checking. May change the type of editableValue */
+    if(value->hasValue && value->value.type) {
+        adjustValue(server, &adjustedValue.value, &node->dataType);
+
+        /* The value may be an extension object, especially the nodeset compiler
+         * uses extension objects to write variable values. If value is an
+         * extension object we check if the current node value is also an
+         * extension object. */
+        const UA_NodeId nodeDataType = UA_NODEID_NUMERIC(0, UA_NS0ID_STRUCTURE);
+        const UA_NodeId *nodeDataTypePtr = &node->dataType;
+        if(value->value.type->typeId.identifierType == UA_NODEIDTYPE_NUMERIC &&
+           value->value.type->typeId.identifier.numeric == UA_NS0ID_STRUCTURE)
+            nodeDataTypePtr = &nodeDataType;
+
+        if(!compatibleValue(server, session, nodeDataTypePtr, node->valueRank,
+                            node->arrayDimensionsSize, node->arrayDimensions,
+                            &adjustedValue.value, rangeptr)) {
+            if(rangeptr)
+                UA_free(range.dimensions);
+            return UA_STATUSCODE_BADTYPEMISMATCH;
+        }
+    }
+
+    /* Set the source timestamp if there is none */
+    UA_DateTime now = UA_DateTime_now();
+    if(!adjustedValue.hasSourceTimestamp) {
+        adjustedValue.sourceTimestamp = now;
+        adjustedValue.hasSourceTimestamp = true;
+    }
+
+    /* Update the timestamp when the value was last updated in the server */
+    adjustedValue.serverTimestamp = now;
+    adjustedValue.hasServerTimestamp = true;
+
+    switch(node->valueBackend.backendType) {
+        case UA_VALUEBACKENDTYPE_NONE:
+            /* Ok, do it */
+            if(node->valueSource == UA_VALUESOURCE_DATA) {
+                if(!rangeptr)
+                    retval = writeValueAttributeWithoutRange(node, &adjustedValue);
+                else
+                    retval = writeValueAttributeWithRange(node, &adjustedValue, rangeptr);
+
+#ifdef UA_ENABLE_HISTORIZING
+                /* node is a UA_VariableNode*, but it may also point to a
+                   UA_VariableTypeNode */
+                /* UA_VariableTypeNode doesn't have the historizing attribute */
+                if(retval == UA_STATUSCODE_GOOD &&
+                   node->head.nodeClass == UA_NODECLASS_VARIABLE &&
+                   server->config.historyDatabase.setValue) {
+                    UA_UNLOCK(server->serviceMutex);
+                    server->config.historyDatabase.
+                        setValue(server, server->config.historyDatabase.context,
+                                 &session->sessionId, session->sessionHandle,
+                                 &node->head.nodeId, node->historizing, &adjustedValue);
+                    UA_LOCK(server->serviceMutex);
+                }
+#endif
+                /* Callback after writing */
+                // Removed by Shen
+                // if(retval == UA_STATUSCODE_GOOD && node->value.data.callback.onWrite) {
+                //     UA_UNLOCK(server->serviceMutex)
+                //     node->value.data.callback.
+                //         onWrite(server, &session->sessionId, session->sessionHandle,
+                //                 &node->head.nodeId, node->head.context,
+                //                 rangeptr, &adjustedValue);
+                //     UA_LOCK(server->serviceMutex);
+
+                // }
+            } else {
+                if(node->value.dataSource.write) {
+                    UA_UNLOCK(server->serviceMutex);
+                    retval = node->value.dataSource.
+                        write(server, &session->sessionId, session->sessionHandle,
+                              &node->head.nodeId, node->head.context,
+                              rangeptr, &adjustedValue);
+                    UA_LOCK(server->serviceMutex);
+                } else {
+                    retval = UA_STATUSCODE_BADWRITENOTSUPPORTED;
+                }
+            }
+            break;
+        case UA_VALUEBACKENDTYPE_INTERNAL:
+            break;
+        case UA_VALUEBACKENDTYPE_DATA_SOURCE_CALLBACK:
+            break;
+        case UA_VALUEBACKENDTYPE_EXTERNAL:
+            if(node->valueBackend.backend.external.callback.userWrite == NULL){
+                if(rangeptr)
+                    UA_free(range.dimensions);
+                return UA_STATUSCODE_BADWRITENOTSUPPORTED;
+            }
+            node->valueBackend.backend.external.callback.
+                userWrite(server, &session->sessionId, session->sessionHandle,
+                          &node->head.nodeId, node->head.context,
+                          rangeptr, &adjustedValue);
+            break;
+    }
+
+    /* Clean up */
+    if(rangeptr)
+        UA_free(range.dimensions);
+    return retval;
+}
+
+static UA_StatusCode
 writeIsAbstractAttribute(UA_Node *node, UA_Boolean value) {
     switch(node->head.nodeClass) {
     case UA_NODECLASS_OBJECTTYPE:
@@ -1616,12 +1743,183 @@ copyAttributeIntoNode(UA_Server *server, UA_Session *session,
     return retval;
 }
 
+static UA_StatusCode
+copyAttributeIntoNodeWithoutCallback(UA_Server *server, UA_Session *session,
+                                     UA_Node *node, const UA_WriteValue *wvalue) {
+    UA_assert(session != NULL);
+    const void *value = wvalue->value.value.data;
+    UA_UInt32 userWriteMask = getUserWriteMask(server, session, &node->head);
+    UA_StatusCode retval = UA_STATUSCODE_GOOD;
+
+    UA_LOG_NODEID_DEBUG(&node->head.nodeId,
+                        UA_LOG_DEBUG_SESSION(&server->config.logger, session,
+                                             "Write attribute %"PRIi32 " of Node %.*s",
+                                             wvalue->attributeId, (int)nodeIdStr.length,
+                                             nodeIdStr.data));
+
+    const UA_VariableTypeNode *type;
+
+    switch(wvalue->attributeId) {
+    case UA_ATTRIBUTEID_NODEID:
+    case UA_ATTRIBUTEID_NODECLASS:
+    case UA_ATTRIBUTEID_USERWRITEMASK:
+    case UA_ATTRIBUTEID_USERACCESSLEVEL:
+    case UA_ATTRIBUTEID_USEREXECUTABLE:
+    case UA_ATTRIBUTEID_BROWSENAME: /* BrowseName is tracked in a binary tree
+                                       for fast lookup */
+        retval = UA_STATUSCODE_BADWRITENOTSUPPORTED;
+        break;
+    case UA_ATTRIBUTEID_DISPLAYNAME:
+        CHECK_USERWRITEMASK(UA_WRITEMASK_DISPLAYNAME);
+        CHECK_DATATYPE_SCALAR(LOCALIZEDTEXT);
+        retval = updateLocalizedText((const UA_LocalizedText *)value,
+                                     &node->head.displayName);
+        break;
+    case UA_ATTRIBUTEID_DESCRIPTION:
+        CHECK_USERWRITEMASK(UA_WRITEMASK_DESCRIPTION);
+        CHECK_DATATYPE_SCALAR(LOCALIZEDTEXT);
+        retval = updateLocalizedText((const UA_LocalizedText *)value,
+                                     &node->head.description);
+        break;
+    case UA_ATTRIBUTEID_WRITEMASK:
+        CHECK_USERWRITEMASK(UA_WRITEMASK_WRITEMASK);
+        CHECK_DATATYPE_SCALAR(UINT32);
+        node->head.writeMask = *(const UA_UInt32*)value;
+        break;
+    case UA_ATTRIBUTEID_ISABSTRACT:
+        CHECK_USERWRITEMASK(UA_WRITEMASK_ISABSTRACT);
+        CHECK_DATATYPE_SCALAR(BOOLEAN);
+        retval = writeIsAbstractAttribute(node, *(const UA_Boolean*)value);
+        break;
+    case UA_ATTRIBUTEID_SYMMETRIC:
+        CHECK_NODECLASS_WRITE(UA_NODECLASS_REFERENCETYPE);
+        CHECK_USERWRITEMASK(UA_WRITEMASK_SYMMETRIC);
+        CHECK_DATATYPE_SCALAR(BOOLEAN);
+        node->referenceTypeNode.symmetric = *(const UA_Boolean*)value;
+        break;
+    case UA_ATTRIBUTEID_INVERSENAME:
+        CHECK_NODECLASS_WRITE(UA_NODECLASS_REFERENCETYPE);
+        CHECK_USERWRITEMASK(UA_WRITEMASK_INVERSENAME);
+        CHECK_DATATYPE_SCALAR(LOCALIZEDTEXT);
+        retval = updateLocalizedText((const UA_LocalizedText *)value,
+                                     &node->referenceTypeNode.inverseName);
+        break;
+    case UA_ATTRIBUTEID_CONTAINSNOLOOPS:
+        CHECK_NODECLASS_WRITE(UA_NODECLASS_VIEW);
+        CHECK_USERWRITEMASK(UA_WRITEMASK_CONTAINSNOLOOPS);
+        CHECK_DATATYPE_SCALAR(BOOLEAN);
+        node->viewNode.containsNoLoops = *(const UA_Boolean*)value;
+        break;
+    case UA_ATTRIBUTEID_EVENTNOTIFIER:
+        CHECK_NODECLASS_WRITE(UA_NODECLASS_VIEW | UA_NODECLASS_OBJECT);
+        CHECK_USERWRITEMASK(UA_WRITEMASK_EVENTNOTIFIER);
+        CHECK_DATATYPE_SCALAR(BYTE);
+        if(node->head.nodeClass == UA_NODECLASS_VIEW) {
+            node->viewNode.eventNotifier = *(const UA_Byte*)value;
+        } else {
+            node->objectNode.eventNotifier = *(const UA_Byte*)value;
+        }
+        break;
+    case UA_ATTRIBUTEID_VALUE:
+        CHECK_NODECLASS_WRITE(UA_NODECLASS_VARIABLE | UA_NODECLASS_VARIABLETYPE);
+        if(node->head.nodeClass == UA_NODECLASS_VARIABLE) {
+            /* The access to a value variable is granted via the AccessLevel
+             * and UserAccessLevel attributes */
+            UA_Byte accessLevel = getAccessLevel(server, session, &node->variableNode);
+            if(!(accessLevel & (UA_ACCESSLEVELMASK_WRITE))) {
+                retval = UA_STATUSCODE_BADNOTWRITABLE;
+                break;
+            }
+            accessLevel = getUserAccessLevel(server, session, &node->variableNode);
+            if(!(accessLevel & (UA_ACCESSLEVELMASK_WRITE))) {
+                retval = UA_STATUSCODE_BADUSERACCESSDENIED;
+                break;
+            }
+        } else { /* UA_NODECLASS_VARIABLETYPE */
+            CHECK_USERWRITEMASK(UA_WRITEMASK_VALUEFORVARIABLETYPE);
+        }
+        retval = writeNodeValueAttributeWithoutCallback(server, session, &node->variableNode,
+                                                        &wvalue->value, &wvalue->indexRange);
+        break;
+    case UA_ATTRIBUTEID_DATATYPE:
+        CHECK_NODECLASS_WRITE(UA_NODECLASS_VARIABLE | UA_NODECLASS_VARIABLETYPE);
+        CHECK_USERWRITEMASK(UA_WRITEMASK_DATATYPE);
+        CHECK_DATATYPE_SCALAR(NODEID);
+        GET_NODETYPE;
+        retval = writeDataTypeAttribute(server, session, &node->variableNode,
+                                        type, (const UA_NodeId*)value);
+        UA_NODESTORE_RELEASE(server, (const UA_Node*)type);
+        break;
+    case UA_ATTRIBUTEID_VALUERANK:
+        CHECK_NODECLASS_WRITE(UA_NODECLASS_VARIABLE | UA_NODECLASS_VARIABLETYPE);
+        CHECK_USERWRITEMASK(UA_WRITEMASK_VALUERANK);
+        CHECK_DATATYPE_SCALAR(INT32);
+        GET_NODETYPE;
+        retval = writeValueRankAttribute(server, session, &node->variableNode,
+                                         type, *(const UA_Int32*)value);
+        UA_NODESTORE_RELEASE(server, (const UA_Node*)type);
+        break;
+    case UA_ATTRIBUTEID_ARRAYDIMENSIONS:
+        CHECK_NODECLASS_WRITE(UA_NODECLASS_VARIABLE | UA_NODECLASS_VARIABLETYPE);
+        CHECK_USERWRITEMASK(UA_WRITEMASK_ARRRAYDIMENSIONS);
+        CHECK_DATATYPE_ARRAY(UINT32);
+        GET_NODETYPE;
+        retval = writeArrayDimensionsAttribute(server, session, &node->variableNode,
+                                               type, wvalue->value.value.arrayLength,
+                                               (UA_UInt32 *)wvalue->value.value.data);
+        UA_NODESTORE_RELEASE(server, (const UA_Node*)type);
+        break;
+    case UA_ATTRIBUTEID_ACCESSLEVEL:
+        CHECK_NODECLASS_WRITE(UA_NODECLASS_VARIABLE);
+        CHECK_USERWRITEMASK(UA_WRITEMASK_ACCESSLEVEL);
+        CHECK_DATATYPE_SCALAR(BYTE);
+        node->variableNode.accessLevel = *(const UA_Byte*)value;
+        break;
+    case UA_ATTRIBUTEID_MINIMUMSAMPLINGINTERVAL:
+        CHECK_NODECLASS_WRITE(UA_NODECLASS_VARIABLE);
+        CHECK_USERWRITEMASK(UA_WRITEMASK_MINIMUMSAMPLINGINTERVAL);
+        CHECK_DATATYPE_SCALAR(DOUBLE);
+        node->variableNode.minimumSamplingInterval = *(const UA_Double*)value;
+        break;
+    case UA_ATTRIBUTEID_HISTORIZING:
+        CHECK_NODECLASS_WRITE(UA_NODECLASS_VARIABLE);
+        CHECK_USERWRITEMASK(UA_WRITEMASK_HISTORIZING);
+        CHECK_DATATYPE_SCALAR(BOOLEAN);
+        node->variableNode.historizing = *(const UA_Boolean*)value;
+        break;
+    case UA_ATTRIBUTEID_EXECUTABLE:
+        CHECK_NODECLASS_WRITE(UA_NODECLASS_METHOD);
+        CHECK_USERWRITEMASK(UA_WRITEMASK_EXECUTABLE);
+        CHECK_DATATYPE_SCALAR(BOOLEAN);
+        node->methodNode.executable = *(const UA_Boolean*)value;
+        break;
+    default:
+        retval = UA_STATUSCODE_BADATTRIBUTEIDINVALID;
+        break;
+    }
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_INFO_SESSION(&server->config.logger, session,
+                            "WriteRequest returned status code %s",
+                            UA_StatusCode_name(retval));
+    }
+    return retval;
+}
+
 static void
 Operation_Write(UA_Server *server, UA_Session *session, void *context,
                 const UA_WriteValue *wv, UA_StatusCode *result) {
     UA_assert(session != NULL);
     *result = UA_Server_editNode(server, session, &wv->nodeId,
                                  (UA_EditNodeCallback)copyAttributeIntoNode,
+                                 (void*)(uintptr_t)wv);
+}
+
+static void
+Operation_WriteWithoutCallback(UA_Server *server, UA_Session *session, void *context,
+                               const UA_WriteValue *wv, UA_StatusCode *result) {
+    UA_assert(session != NULL);
+    *result = UA_Server_editNode(server, session, &wv->nodeId,
+                                 (UA_EditNodeCallback)copyAttributeIntoNodeWithoutCallback,
                                  (void*)(uintptr_t)wv);
 }
 
@@ -1672,6 +1970,17 @@ __UA_Server_write(UA_Server *server, const UA_NodeId *nodeId,
     return res;
 }
 
+UA_StatusCode
+__UA_Server_writeWithoutCallback(UA_Server *server, const UA_NodeId *nodeId,
+                                 const UA_AttributeId attributeId,
+                                 const UA_DataType *attr_type, const void *attr) {
+    UA_LOCK(server->serviceMutex);
+    UA_StatusCode res = writeAttributeWithoutCallback(server, &server->adminSession,
+                                                      nodeId, attributeId, attr, attr_type);
+    UA_UNLOCK(server->serviceMutex);
+    return res;
+}
+
 /* Internal convenience function */
 UA_StatusCode
 writeAttribute(UA_Server *server, UA_Session *session,
@@ -1696,6 +2005,33 @@ writeAttribute(UA_Server *server, UA_Session *session,
 
     UA_StatusCode res = UA_STATUSCODE_GOOD;
     Operation_Write(server, session, NULL, &wvalue, &res);
+    return res;
+}
+
+/* Internal convenience function */
+UA_StatusCode
+writeAttributeWithoutCallback(UA_Server *server, UA_Session *session,
+                              const UA_NodeId *nodeId, const UA_AttributeId attributeId,
+                              const void *attr, const UA_DataType *attr_type) {
+    UA_LOCK_ASSERT(server->serviceMutex, 1);
+
+    UA_WriteValue wvalue;
+    UA_WriteValue_init(&wvalue);
+    wvalue.nodeId = *nodeId;
+    wvalue.attributeId = attributeId;
+    wvalue.value.hasValue = true;
+    if(attr_type == &UA_TYPES[UA_TYPES_VARIANT]) {
+        wvalue.value.value = *(const UA_Variant*)attr;
+    } else if(attr_type == &UA_TYPES[UA_TYPES_DATAVALUE]) {
+        wvalue.value = *(const UA_DataValue*)attr;
+    } else {
+        /* hacked cast. the target WriteValue is used as const anyway */
+        UA_Variant_setScalar(&wvalue.value.value,
+                             (void*)(uintptr_t)attr, attr_type);
+    }
+
+    UA_StatusCode res = UA_STATUSCODE_GOOD;
+    Operation_WriteWithoutCallback(server, session, NULL, &wvalue, &res);
     return res;
 }
 

@@ -363,6 +363,11 @@ writeAttribute(UA_Server *server, UA_Session *session,
                const UA_NodeId *nodeId, const UA_AttributeId attributeId,
                const void *attr, const UA_DataType *attr_type);
 
+UA_StatusCode
+writeAttributeWithoutCallback(UA_Server *server, UA_Session *session,
+                              const UA_NodeId *nodeId, const UA_AttributeId attributeId,
+                              const void *attr, const UA_DataType *attr_type);
+
 static UA_INLINE UA_StatusCode
 writeValueAttribute(UA_Server *server, UA_Session *session,
                     const UA_NodeId *nodeId, const UA_Variant *value) {

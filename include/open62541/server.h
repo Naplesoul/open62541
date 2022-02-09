@@ -608,6 +608,11 @@ __UA_Server_write(UA_Server *server, const UA_NodeId *nodeId,
                   const UA_AttributeId attributeId,
                   const UA_DataType *attr_type, const void *attr);
 
+UA_StatusCode UA_EXPORT UA_THREADSAFE
+__UA_Server_writeWithoutCallback(UA_Server *server, const UA_NodeId *nodeId,
+                                 const UA_AttributeId attributeId,
+                                 const UA_DataType *attr_type, const void *attr);
+
 static UA_INLINE UA_THREADSAFE UA_StatusCode
 UA_Server_writeBrowseName(UA_Server *server, const UA_NodeId nodeId,
                           const UA_QualifiedName browseName) {
@@ -667,6 +672,19 @@ UA_Server_writeValue(UA_Server *server, const UA_NodeId nodeId,
                      const UA_Variant value) {
     return __UA_Server_write(server, &nodeId, UA_ATTRIBUTEID_VALUE,
                              &UA_TYPES[UA_TYPES_VARIANT], &value);
+}
+
+/**
+ * Writes an UA_Variant to a variable/variableType node while not calling onwrite callback.
+ * StatusCode is set to UA_STATUSCODE_GOOD, sourceTimestamp and
+ * serverTimestamp are set to UA_DateTime_now()
+ * added by Shen
+ */
+static UA_INLINE UA_THREADSAFE UA_StatusCode
+UA_Server_writeValueWithoutCallback(UA_Server *server, const UA_NodeId nodeId,
+                                    const UA_Variant value) {
+    return __UA_Server_writeWithoutCallback(server, &nodeId, UA_ATTRIBUTEID_VALUE,
+                                            &UA_TYPES[UA_TYPES_VARIANT], &value);
 }
 
 /**
